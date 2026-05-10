@@ -4,8 +4,9 @@ __pycache__/
 *.pyo
 *.pyd
 
-# PyInstaller intermediate artifacts (the final .exe in dist/ IS tracked)
+# PyInstaller build artifacts (binaries are published as GitHub Releases, not tracked in git)
 build/
+dist/
 *.spec
 
 # User-specific config (contains the speaker IP)
