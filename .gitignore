@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# PyInstaller intermediate artifacts (the final .exe in dist/ IS tracked)
+build/
+*.spec
+
+# User-specific config (contains the speaker IP)
+/config.json
+/dist/config.json
+
+# IDE / editor
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store

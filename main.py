@@ -3,16 +3,22 @@ KEF LSX II Controller
 GUI application built on top of pykefcontrol.
 """
 
+import sys
+import json
 import time
 import queue
 import threading
+import ctypes
+import ctypes.wintypes
 import urllib.request
 import concurrent.futures
 from io import BytesIO
+from pathlib import Path
 from tkinter import messagebox
 
 import customtkinter as ctk
-from PIL import Image
+import pystray
+from PIL import Image, ImageDraw
 
 from pykefcontrol.kef_connector import KefConnector
 
@@ -37,10 +43,74 @@ SOURCE_LABELS = {
 PWR_ON      = "powerOn"
 PWR_STANDBY = "standby"
 
-COLOR_SRC_ACTIVE  = "#1a6b3c"
 COLOR_SRC_DEFAULT = ["#3B8ED0", "#1F6AA5"]
 COLOR_PWR_ON      = ("#1a6b3c", "#25a05a")
 COLOR_PWR_OFF     = ("#6b1a1a", "#a02525")
+
+# KEF LSX II LED colors per source (verified by user)
+SOURCE_COLORS = {
+    "wifi":      "#FFFFFF",  # white
+    "bluetooth": "#1F6AA5",  # blue
+    "tv":        "#00C8AA",  # cyan green
+    "optical":   "#D63384",  # magenta
+    "analog":    "#FFC107",  # yellow
+    "usb":       "#F8BA87",  # pastel orange
+}
+
+
+def _hex_to_rgb(hex_color):
+    h = hex_color.lstrip("#")
+    return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+
+POLL_INTERVAL_S = 1    # seconds between poll cycles
+
+# When frozen by PyInstaller --onefile, __file__ points to a temp extract dir
+# that's wiped on exit. Use the .exe location so config.json persists.
+if getattr(sys, "frozen", False):
+    CONFIG_PATH = Path(sys.executable).parent / "config.json"
+else:
+    CONFIG_PATH = Path(__file__).parent / "config.json"
+
+
+def _resource_path(rel):
+    """Locate a bundled resource both in dev mode and inside a PyInstaller exe."""
+    if getattr(sys, "frozen", False):
+        base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    else:
+        base = Path(__file__).parent
+    return base / rel
+
+
+ICON_PATH = _resource_path("Kef-LSX-HP.ico")
+
+# Low-level mouse hook (scroll over the tray icon)
+_WH_MOUSE_LL   = 14
+_WM_MOUSEWHEEL = 0x020A
+
+class _MSLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("pt",          ctypes.wintypes.POINT),
+        ("mouseData",   ctypes.wintypes.DWORD),
+        ("flags",       ctypes.wintypes.DWORD),
+        ("time",        ctypes.wintypes.DWORD),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
+class _GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", ctypes.c_ulong),
+        ("Data2", ctypes.c_ushort),
+        ("Data3", ctypes.c_ushort),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+class _NOTIFYICONIDENTIFIER(ctypes.Structure):
+    _fields_ = [
+        ("cbSize",   ctypes.wintypes.DWORD),
+        ("hWnd",     ctypes.wintypes.HWND),
+        ("uID",      ctypes.wintypes.UINT),
+        ("guidItem", _GUID),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -58,14 +128,38 @@ def _separator(parent):
 class KefApp(ctk.CTk):
 
     def __init__(self):
+        # DPI-aware BEFORE any window creation, otherwise the mouse hook
+        # coordinates won't match what GetWindowRect returns.
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
+        # Custom AppUserModelID so Windows groups the taskbar entry under
+        # our app instead of grouping it under python.exe.
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "KEF.LSX.Controller")
+        except Exception:
+            pass
+
         super().__init__()
         self.title("KEF LSX II Controller")
         self.geometry("880x600")
-        self.resizable(False, False)
+        self.minsize(880, 600)
+        self.resizable(True, True)
+        try:
+            self.iconbitmap(str(ICON_PATH))
+        except Exception:
+            pass
 
-        # Speaker handle
-        self.speaker = None
-        self._connected = False
+        # Speaker handle — read/written via property to protect cross-thread access
+        self._speaker_lock = threading.Lock()
+        self._speaker      = None
+        self._connected    = False
 
         # Background worker pool (3 threads: connect, poll, cover)
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
@@ -79,13 +173,65 @@ class KefApp(ctk.CTk):
         self._song_length_ms = 0
         self._cover_url      = None
         self._no_cover_img   = None
-        self._vol_debounce   = None
+        self._volume         = 30
+        self._tray_icon      = None
+
+        self._hook      = None
+        self._hook_proc = None
 
         self._build_ui()
+        has_config = self._load_config()
+        self._setup_tray()
+        self._setup_mouse_hook()
 
         # Drain the UI queue every 200 ms
         self.after(200, self._drain_queue)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # First launch (no config yet): show the window so the user can
+        # enter the speaker IP. Otherwise stay hidden in the tray.
+        if has_config:
+            self.withdraw()
+
+    # =========================================================================
+    # Thread-safe speaker property
+    # =========================================================================
+
+    @property
+    def speaker(self):
+        with self._speaker_lock:
+            return self._speaker
+
+    @speaker.setter
+    def speaker(self, value):
+        with self._speaker_lock:
+            self._speaker = value
+
+    # =========================================================================
+    # Config persistence
+    # =========================================================================
+
+    def _load_config(self):
+        """Returns True if a usable config (with an IP) was loaded."""
+        try:
+            with CONFIG_PATH.open() as f:
+                data = json.load(f)
+            ip = data.get("ip", "")
+            if ip:
+                self._ip_var.set(ip)
+                # Auto-connect once the window is ready
+                self.after(300, self._connect)
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _save_config(self):
+        try:
+            with CONFIG_PATH.open("w") as f:
+                json.dump({"ip": self._ip_var.get().strip()}, f)
+        except Exception:
+            pass
 
     # =========================================================================
     # UI construction
@@ -301,6 +447,8 @@ class KefApp(ctk.CTk):
             state="disabled", command=self._on_vol_drag)
         self._vol_slider.pack(side="left", fill="x", expand=True)
         self._vol_slider.set(30)
+        # Mouse wheel over the slider tweaks the volume
+        self._vol_slider.bind("<MouseWheel>", self._on_slider_scroll)
 
     # =========================================================================
     # UI helpers
@@ -338,9 +486,11 @@ class KefApp(ctk.CTk):
 
     def _highlight_source(self, active_src):
         for src, btn in self._src_btns.items():
-            btn.configure(
-                fg_color=COLOR_SRC_ACTIVE if src == active_src
-                else COLOR_SRC_DEFAULT)
+            if src == active_src:
+                btn.configure(fg_color=SOURCE_COLORS.get(src, "#1a6b3c"))
+            else:
+                btn.configure(fg_color=COLOR_SRC_DEFAULT)
+        self._update_tray_icon(active_src)
 
     @staticmethod
     def _ms_to_str(ms):
@@ -382,6 +532,13 @@ class KefApp(ctk.CTk):
                     self._conn_btn.configure(
                         state="normal", text="Connect",
                         command=self._connect)
+                elif kind == "lost":
+                    self._on_connection_lost(data)
+                elif kind == "cmd_error":
+                    # Show briefly in status label; next poll overwrites it
+                    self._status_lbl.configure(text=f"Err: {data[:28]}")
+                elif kind == "scroll_volume":
+                    self._scroll_volume(data)
         except Exception:
             pass
         self.after(200, self._drain_queue)
@@ -403,6 +560,7 @@ class KefApp(ctk.CTk):
         try:
             spk = KefConnector(ip)
             self.speaker = spk
+            self._save_config()
             self._ui_q.put(("connected", {
                 "status":   spk.status,
                 "name":     spk.speaker_name,
@@ -440,6 +598,15 @@ class KefApp(ctk.CTk):
         self._fw_lbl.configure(text="")
         self._enable_controls(False)
         self._reset_now_playing()
+        self._update_tray_icon(None)
+        self._update_tray_title()
+
+    def _on_connection_lost(self, reason):
+        if self._connected:
+            self._disconnect()
+            messagebox.showwarning(
+                "Connection Lost",
+                f"Lost connection to speaker:\n{reason}")
 
     # =========================================================================
     # Background state fetch (full refresh)
@@ -464,8 +631,8 @@ class KefApp(ctk.CTk):
                 except Exception:
                     pass
             self._ui_q.put(("state", state))
-        except Exception:
-            pass
+        except Exception as exc:
+            self._ui_q.put(("cmd_error", f"Refresh: {exc}"))
 
     # =========================================================================
     # Polling loop (background thread)
@@ -484,6 +651,8 @@ class KefApp(ctk.CTk):
                     self._ui_q.put(("state", changes))
             except Exception:
                 time.sleep(2)
+                continue
+            time.sleep(POLL_INTERVAL_S)
 
     # =========================================================================
     # State application (main thread)
@@ -510,8 +679,10 @@ class KefApp(ctk.CTk):
         vol = state.get("volume")
         if vol is not None:
             v = int(vol)
+            self._volume = v
             self._vol_slider.set(v)
             self._vol_lbl.configure(text=str(v))
+            self._update_tray_title(v)
 
         # Mute (hardware mute flag from speaker)
         muted = state.get("mute")
@@ -575,13 +746,12 @@ class KefApp(ctk.CTk):
     # =========================================================================
 
     def _run(self, fn):
-        """Submit fn to thread pool only when connected."""
         if self.speaker and self._connected:
             def _safe():
                 try:
                     fn()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self._ui_q.put(("cmd_error", str(exc)))
             self._executor.submit(_safe)
 
     def _cmd_power_on(self):
@@ -630,24 +800,187 @@ class KefApp(ctk.CTk):
 
     def _on_vol_drag(self, value):
         v = int(value)
+        if v == self._volume:
+            return  # filter duplicate steps to avoid spamming the speaker
+        self._volume = v
         self._vol_lbl.configure(text=str(v))
-        if self._vol_debounce:
-            self.after_cancel(self._vol_debounce)
-        # Apply 300 ms after the user stops dragging
-        self._vol_debounce = self.after(
-            300,
-            lambda: self._run(lambda: self.speaker.set_volume(v))
-            if self.speaker else None,
+        # Live send (no debounce)
+        self._run(lambda: self.speaker.set_volume(v))
+        self._update_tray_title(v)
+
+    def _on_slider_scroll(self, event):
+        step = 1 if event.delta > 0 else -1
+        self._scroll_volume(step)
+
+    # =========================================================================
+    # System tray
+    # =========================================================================
+
+    def _setup_mouse_hook(self):
+        # The hook MUST run in a dedicated thread with its own message loop,
+        # otherwise it interrupts tkinter at moments where the GIL is not
+        # available -> Fatal Python error.
+        threading.Thread(target=self._hook_thread_proc, daemon=True).start()
+
+    def _hook_thread_proc(self):
+        user32  = ctypes.windll.user32
+        shell32 = ctypes.windll.shell32
+
+        WPARAM_T  = ctypes.c_size_t
+        LPARAM_T  = ctypes.c_ssize_t
+        LRESULT_T = ctypes.c_ssize_t
+
+        user32.CallNextHookEx.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, WPARAM_T, LPARAM_T]
+        user32.CallNextHookEx.restype = LRESULT_T
+
+        shell32.Shell_NotifyIconGetRect.argtypes = [
+            ctypes.POINTER(_NOTIFYICONIDENTIFIER),
+            ctypes.POINTER(ctypes.wintypes.RECT)]
+        shell32.Shell_NotifyIconGetRect.restype = ctypes.c_long
+
+        HOOKPROC = ctypes.WINFUNCTYPE(
+            LRESULT_T, ctypes.c_int, WPARAM_T, LPARAM_T)
+
+        user32.SetWindowsHookExW.argtypes = [
+            ctypes.c_int, HOOKPROC, ctypes.c_void_p, ctypes.wintypes.DWORD]
+        user32.SetWindowsHookExW.restype = ctypes.c_void_p
+
+        user32.GetMessageW.argtypes = [
+            ctypes.POINTER(ctypes.wintypes.MSG),
+            ctypes.c_void_p, ctypes.wintypes.UINT, ctypes.wintypes.UINT]
+        user32.GetMessageW.restype = ctypes.c_int
+
+        def _on_icon(x, y):
+            try:
+                hwnd = getattr(self._tray_icon, "_hwnd", None)
+                if not hwnd:
+                    return False
+                nid = _NOTIFYICONIDENTIFIER()
+                nid.cbSize = ctypes.sizeof(_NOTIFYICONIDENTIFIER)
+                nid.hWnd   = hwnd
+                nid.uID    = 0
+                rect = ctypes.wintypes.RECT()
+                if shell32.Shell_NotifyIconGetRect(
+                        ctypes.byref(nid), ctypes.byref(rect)) != 0:
+                    return False
+                return (rect.left <= x <= rect.right
+                        and rect.top <= y <= rect.bottom)
+            except Exception:
+                return False
+
+        def _handler(nCode, wParam, lParam):
+            try:
+                if nCode >= 0 and wParam == _WM_MOUSEWHEEL:
+                    info = ctypes.cast(
+                        lParam, ctypes.POINTER(_MSLLHOOKSTRUCT)).contents
+                    if _on_icon(info.pt.x, info.pt.y):
+                        delta = ctypes.c_short(info.mouseData >> 16).value
+                        step = 1 if delta > 0 else -1
+                        # Never call tkinter directly from this thread;
+                        # push to the UI queue drained by the main thread.
+                        self._ui_q.put(("scroll_volume", step))
+                        return 1  # block the wheel event
+            except Exception:
+                pass
+            return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+        self._hook_proc = HOOKPROC(_handler)
+        self._hook = user32.SetWindowsHookExW(
+            _WH_MOUSE_LL, self._hook_proc, None, 0)
+
+        # Message pump: without this, low-level hooks are never invoked
+        msg = ctypes.wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+
+    def _scroll_volume(self, step):
+        if not self._connected:
+            return
+        new_vol = max(0, min(100, self._volume + step))
+        self._volume = new_vol
+        self._vol_slider.set(new_vol)
+        self._vol_lbl.configure(text=str(new_vol))
+        # Live - send immediately without debounce
+        self._run(lambda: self.speaker.set_volume(new_vol))
+        self._update_tray_title(new_vol)
+
+    def _update_tray_title(self, vol=None):
+        if not self._tray_icon:
+            return
+        if not self._connected:
+            self._tray_icon.title = "KEF LSX II (disconnected)"
+            return
+        if vol is None:
+            vol = self._volume
+        self._tray_icon.title = f"KEF LSX II ({vol}%)"
+
+    @staticmethod
+    def _make_tray_image(bg_hex="#1a6b3c"):
+        # Solid square - no ellipse anti-aliasing so the displayed color
+        # in the tray exactly matches the UI button color.
+        size = 64
+        img = Image.new("RGB", (size, size), bg_hex)
+        draw = ImageDraw.Draw(img)
+        r, g, b = _hex_to_rgb(bg_hex)
+        luma = 0.299 * r + 0.587 * g + 0.114 * b
+        fg = "black" if luma > 160 else "white"
+        lw = 8
+        draw.line([(18, 10), (18, 54)], fill=fg, width=lw)
+        draw.line([(18, 32), (50, 10)], fill=fg, width=lw)
+        draw.line([(18, 32), (50, 54)], fill=fg, width=lw)
+        return img
+
+    def _update_tray_icon(self, source=None):
+        if not self._tray_icon:
+            return
+        bg_hex = SOURCE_COLORS.get(source, "#5A5A5A")
+        try:
+            self._tray_icon.icon = self._make_tray_image(bg_hex)
+        except Exception:
+            pass
+
+    def _setup_tray(self):
+        menu = pystray.Menu(
+            pystray.MenuItem("USB", self._tray_activate_usb, default=True),
+            pystray.MenuItem("Open", self._tray_show_main),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Quit", self._tray_quit),
         )
+        self._tray_icon = pystray.Icon(
+            "KEF LSX II", self._make_tray_image(), "KEF LSX II", menu)
+        threading.Thread(target=self._tray_icon.run, daemon=True).start()
+
+    def _tray_activate_usb(self, _icon, _item):
+        self.after(0, lambda: self._cmd_set_source("usb"))
+
+    def _tray_show_main(self, _icon, _item):
+        self.after(0, self._show_main_window)
+
+    def _tray_quit(self, _icon, _item):
+        self.after(0, self._quit_app)
+
+    def _show_main_window(self):
+        self.deiconify()
+        self.lift()
+        self.focus_force()
 
     # =========================================================================
     # Cleanup
     # =========================================================================
 
-    def _on_close(self):
+    def _quit_app(self):
         self._poll_running = False
+        if self._hook:
+            ctypes.windll.user32.UnhookWindowsHookEx(self._hook)
+        if self._tray_icon:
+            self._tray_icon.stop()
         self._executor.shutdown(wait=False)
         self.destroy()
+
+    def _on_close(self):
+        self.withdraw()  # minimize to tray instead of quitting
 
 
 # ---------------------------------------------------------------------------
