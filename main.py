@@ -3,6 +3,7 @@ KEF LSX II Controller
 GUI application built on top of pykefcontrol.
 """
 
+import os
 import sys
 import json
 import time
@@ -10,6 +11,7 @@ import queue
 import threading
 import ctypes
 import ctypes.wintypes
+import winreg
 import urllib.request
 import concurrent.futures
 from io import BytesIO
@@ -64,12 +66,24 @@ def _hex_to_rgb(hex_color):
 
 POLL_INTERVAL_S = 1    # seconds between poll cycles
 
-# When frozen by PyInstaller --onefile, __file__ points to a temp extract dir
-# that's wiped on exit. Use the .exe location so config.json persists.
-if getattr(sys, "frozen", False):
-    CONFIG_PATH = Path(sys.executable).parent / "config.json"
-else:
-    CONFIG_PATH = Path(__file__).parent / "config.json"
+# Store config in %APPDATA%\KefLSXController so it works even when the .exe
+# lives in a write-protected location like C:\Program Files\.
+# Fall back to the .exe / source directory if APPDATA is unavailable.
+def _resolve_config_path():
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        cfg_dir = Path(appdata) / "KefLSXController"
+        try:
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+            return cfg_dir / "config.json"
+        except Exception:
+            pass
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent / "config.json"
+    return Path(__file__).parent / "config.json"
+
+
+CONFIG_PATH = _resolve_config_path()
 
 
 def _resource_path(rel):
@@ -114,6 +128,40 @@ class _NOTIFYICONIDENTIFIER(ctypes.Structure):
 
 
 # ---------------------------------------------------------------------------
+# Windows startup registry helpers
+# ---------------------------------------------------------------------------
+_STARTUP_REG_KEY  = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_STARTUP_REG_NAME = "KEF LSX Controller"
+
+
+def _startup_exe_path():
+    return f'"{sys.executable}"'
+
+
+def _is_startup_enabled():
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_REG_KEY,
+                            0, winreg.KEY_READ) as key:
+            val, _ = winreg.QueryValueEx(key, _STARTUP_REG_NAME)
+            return val == _startup_exe_path()
+    except Exception:
+        return False
+
+
+def _set_startup(enabled):
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_REG_KEY,
+                            0, winreg.KEY_WRITE) as key:
+            if enabled:
+                winreg.SetValueEx(key, _STARTUP_REG_NAME, 0,
+                                  winreg.REG_SZ, _startup_exe_path())
+            else:
+                winreg.DeleteValue(key, _STARTUP_REG_NAME)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Helper widget
 # ---------------------------------------------------------------------------
 def _separator(parent):
@@ -127,7 +175,7 @@ def _separator(parent):
 # ---------------------------------------------------------------------------
 class KefApp(ctk.CTk):
 
-    def __init__(self):
+    def __init__(self, show_event=None):
         # DPI-aware BEFORE any window creation, otherwise the mouse hook
         # coordinates won't match what GetWindowRect returns.
         try:
@@ -178,6 +226,11 @@ class KefApp(ctk.CTk):
 
         self._hook      = None
         self._hook_proc = None
+
+        if show_event:
+            threading.Thread(
+                target=self._wait_show_event, args=(show_event,),
+                daemon=True).start()
 
         self._build_ui()
         has_config = self._load_config()
@@ -539,6 +592,8 @@ class KefApp(ctk.CTk):
                     self._status_lbl.configure(text=f"Err: {data[:28]}")
                 elif kind == "scroll_volume":
                     self._scroll_volume(data)
+                elif kind == "show":
+                    self._show_main_window()
         except Exception:
             pass
         self.after(200, self._drain_queue)
@@ -663,6 +718,8 @@ class KefApp(ctk.CTk):
         pwr = state.get("speaker_status")
         if pwr:
             self._update_power_status(pwr)
+            if pwr == PWR_STANDBY:
+                self._update_tray_icon(None)  # grey when off
 
         # Player state (playing / paused / stopped / buffering …)
         player_state = state.get("status")
@@ -822,6 +879,17 @@ class KefApp(ctk.CTk):
         # available -> Fatal Python error.
         threading.Thread(target=self._hook_thread_proc, daemon=True).start()
 
+    def _wait_show_event(self, event_handle):
+        kernel32 = ctypes.windll.kernel32
+        kernel32.WaitForSingleObject.argtypes = [
+            ctypes.c_void_p, ctypes.wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = ctypes.wintypes.DWORD
+        INFINITE     = 0xFFFFFFFF
+        WAIT_OBJECT_0 = 0x00000000
+        while True:
+            if kernel32.WaitForSingleObject(event_handle, INFINITE) == WAIT_OBJECT_0:
+                self._ui_q.put(("show", None))
+
     def _hook_thread_proc(self):
         user32  = ctypes.windll.user32
         shell32 = ctypes.windll.shell32
@@ -946,6 +1014,12 @@ class KefApp(ctk.CTk):
             pystray.MenuItem("USB", self._tray_activate_usb, default=True),
             pystray.MenuItem("Open", self._tray_show_main),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem(
+                "Run with Windows",
+                self._tray_toggle_startup,
+                checked=lambda _: _is_startup_enabled(),
+            ),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", self._tray_quit),
         )
         self._tray_icon = pystray.Icon(
@@ -957,6 +1031,9 @@ class KefApp(ctk.CTk):
 
     def _tray_show_main(self, _icon, _item):
         self.after(0, self._show_main_window)
+
+    def _tray_toggle_startup(self, *_):
+        _set_startup(not _is_startup_enabled())
 
     def _tray_quit(self, _icon, _item):
         self.after(0, self._quit_app)
@@ -984,8 +1061,57 @@ class KefApp(ctk.CTk):
 
 
 # ---------------------------------------------------------------------------
+# Single-instance guard (named Windows mutex + named event)
+# ---------------------------------------------------------------------------
+_SINGLE_INSTANCE_MUTEX = "Local\\KEF.LSX.Controller.SingleInstance"
+_SINGLE_INSTANCE_EVENT = "Local\\KEF.LSX.Controller.ShowWindow"
+
+_EVENT_MODIFY_STATE = 0x0002
+
+
+def _acquire_single_instance():
+    """Returns the mutex handle if this is the first instance, else signals the
+    existing instance to show its window and returns None.
+
+    Keep the returned handle alive for the process lifetime.
+    """
+    ERROR_ALREADY_EXISTS = 183
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW.argtypes = [
+        ctypes.c_void_p, ctypes.wintypes.BOOL, ctypes.c_wchar_p]
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    handle = kernel32.CreateMutexW(None, False, _SINGLE_INSTANCE_MUTEX)
+    if not handle:
+        return None
+    if ctypes.GetLastError() == ERROR_ALREADY_EXISTS:
+        kernel32.CloseHandle(handle)
+        kernel32.OpenEventW.argtypes = [
+            ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.c_wchar_p]
+        kernel32.OpenEventW.restype = ctypes.c_void_p
+        ev = kernel32.OpenEventW(_EVENT_MODIFY_STATE, False, _SINGLE_INSTANCE_EVENT)
+        if ev:
+            kernel32.SetEvent(ev)
+            kernel32.CloseHandle(ev)
+        return None
+    return handle
+
+
+def _create_show_event():
+    """Creates the named auto-reset event the first instance listens on."""
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateEventW.argtypes = [
+        ctypes.c_void_p, ctypes.wintypes.BOOL, ctypes.wintypes.BOOL, ctypes.c_wchar_p]
+    kernel32.CreateEventW.restype = ctypes.c_void_p
+    return kernel32.CreateEventW(None, False, False, _SINGLE_INSTANCE_EVENT)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    app = KefApp()
+    _instance_handle = _acquire_single_instance()
+    if _instance_handle is None:
+        sys.exit(0)
+    _show_event = _create_show_event()
+    app = KefApp(show_event=_show_event)
     app.mainloop()

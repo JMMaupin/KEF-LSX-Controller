@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell($r2 = Invoke-WebRequest -Uri \"https://api.github.com/repos/JMMaupin/KEF-LSX-II-Controller/contents/dist/KEF%20LSX%20Controller.exe\" -UseBasicParsing -ErrorAction SilentlyContinue; if\\($r2\\){ \\($r2.Content | ConvertFrom-Json | Select-Object name, size, sha, download_url\\) } else { \"KEF-LSX-II-Controller introuvable\" })",
+      "WebFetch(domain:api.github.com)",
+      "PowerShell(winget install --id GitHub.cli --silent --accept-source-agreements --accept-package-agreements 2>&1)",
+      "PowerShell($env:Path = \"$env:Path;C:\\\\Program Files\\\\GitHub CLI\"; gh --version)",
+      "PowerShell($env:Path = \"$env:Path;C:\\\\Program Files\\\\GitHub CLI\"; gh auth status 2>&1)",
+      "Bash(git rm *)",
+      "Bash(git add *)",
+      "Bash(git commit -m 'Stop tracking built binaries; publish via GitHub Releases *)",
+      "Bash(git push *)",
+      "Bash(git remote *)",
+      "Bash(git tag *)"
+    ]
+  }
+}
