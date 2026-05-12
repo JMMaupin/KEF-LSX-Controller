@@ -38,10 +38,11 @@ SOURCE_LABELS = {
     "wifi":      "WiFi",
     "bluetooth": "Bluetooth",
     "tv":        "TV",
-    "optical":   "Optical",
-    "analog":    "Analog",
+    "optical":   "Opt",
+    "analog":    "Aux",
     "usb":        "USB",
 }
+
 PWR_ON      = "powerOn"
 PWR_STANDBY = "standby"
 
@@ -59,10 +60,160 @@ SOURCE_COLORS = {
     "usb":       "#F8BA87",  # pastel orange
 }
 
+BTN_SIZE = 34  # diameter of source buttons in px
+
+# ---------------------------------------------------------------------------
+# Left-panel layout (absolute coordinates inside the 220×~440 left panel)
+# Edit these values, save, and relaunch the app to reposition elements.
+# Format: (x, y) is the top-left corner of each element.
+# ---------------------------------------------------------------------------
+LEFT_PANEL_W = 200   # width of the left panel
+LEFT_PANEL_H = 440   # used as min height reference
+
+LAYOUT = {
+    # Header
+    "title":           {"x":  60, "y":  10},
+
+    # IP + Connect (same row)
+    "ip_entry":        {"x":  10, "y":  40, "w": 100, "h": 26},
+    "conn_btn":        {"x": 115, "y":  40, "w":  75, "h": 26},
+
+    # Auto-start checkbox
+    "auto_usb_check":  {"x":  10, "y":  74},
+
+    # Separator 1
+    "sep1":            {"x":  10, "y": 104, "w": 200, "h": 1},
+
+    # Speaker name (bold)
+    "name_lbl":        {"x":  10, "y": 116, "w": 200},
+
+    # Model (left) + FW (right) on same y
+    "model_lbl":       {"x":  10, "y": 138},
+    "fw_lbl":          {"x": 100, "y": 138, "w":  80},
+
+    # Separator 2
+    "sep2":            {"x":  10, "y": 162, "w": 200, "h": 1},
+
+    # Power status (left) + "Input Source" (right) on same y
+    "status_dot":      {"x":  10, "y": 175},
+    "status_lbl":      {"x":  28, "y": 175},
+    "input_src_lbl":   {"x": 110, "y": 175},
+
+    # Source buttons: top-left of each cell. The button is centered horizontally
+    # inside a CELL_W-wide cell; the label sits just below the icon.
+    "btn_grid_y":      210,    # y of the first row of buttons
+    "btn_row_h":        60,    # vertical spacing between row 1 and row 2
+    "btn_cols_x":     [16, 80, 144],   # x of each of the 3 columns
+}
+
+# Font sizes (in pt) for each text element. Increase a value to make text
+# larger — you will likely need to adjust the matching y in LAYOUT too.
+# Rough rule: +2 pt of font ≈ +3 px of height for that element.
+FONTS = {
+    "title":           14,   # "KEF Controller"
+    "ip_entry":        11,
+    "conn_btn":        11,
+    "auto_usb_check":  10,
+    "name_lbl":        12,   # speaker name (bold)
+    "model_lbl":       10,
+    "fw_lbl":          10,
+    "status_dot":      13,
+    "status_lbl":      11,
+    "input_src_lbl":   11,   # "Input Source" header
+    "btn_label":        9,   # WiFi / Bluetooth / TV ... under each button
+}
+
 
 def _hex_to_rgb(hex_color):
     h = hex_color.lstrip("#")
     return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+
+
+def _draw_wifi(draw, size, color):
+    """Draw an official WiFi icon (3 arcs + dot) centered in the image."""
+    cx, cy = size // 2, size // 2 + size // 10
+    lw = max(2, size // 14)
+    for r in [size // 3, size // 4 - 1, size // 6 - 1]:
+        if r <= 0:
+            continue
+        draw.arc([cx - r, cy - r, cx + r, cy + r],
+                 start=225, end=315, fill=color, width=lw)
+    # Dot
+    dr = max(1, size // 16)
+    dot_y = cy + size // 4
+    draw.ellipse([cx - dr, dot_y - dr, cx + dr, dot_y + dr], fill=color)
+
+
+def _draw_bluetooth(draw, size, color):
+    """Draw an official Bluetooth icon (rune shape) centered in the image."""
+    cx, cy = size // 2, size // 2
+    lw = max(2, size // 14)
+    h = size // 3
+    w = size // 5
+    top = cy - h
+    bot = cy + h
+    left = cx - w
+    right = cx + w
+    # Bluetooth rune: 8 line segments forming the classic shape
+    pts = [
+        ((cx, top), (right, cy)),
+        ((right, cy), (cx, bot)),
+        ((cx, top), (cx, bot)),
+        ((left, cy - h // 2), (right, cy + h // 2)),
+        ((left, cy + h // 2), (right, cy - h // 2)),
+    ]
+    for a, b in pts:
+        draw.line([a, b], fill=color, width=lw)
+
+
+def _make_source_btn_image(src, active, size=BTN_SIZE):
+    """Render a circular button image with the source's icon/text.
+
+    Uses 4× supersampling: everything is drawn on a canvas 4 times bigger,
+    then resized down with LANCZOS for smooth antialiased edges.
+    """
+    SS = 4                       # supersampling factor
+    big = size * SS
+    img = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    if active:
+        bg = SOURCE_COLORS.get(src, "#FFFFFF")
+        fg = "#1a1a1a"
+    else:
+        bg = "#3a3a3a"
+        fg = "#bbbbbb"
+
+    bg_rgb = _hex_to_rgb(bg)
+    fg_rgb = _hex_to_rgb(fg)
+
+    # Circle background (drawn at 4× resolution → smooth after downscale)
+    draw.ellipse([0, 0, big - 1, big - 1], fill=bg_rgb)
+
+    if src == "wifi":
+        _draw_wifi(draw, big, fg_rgb)
+    elif src == "bluetooth":
+        _draw_bluetooth(draw, big, fg_rgb)
+    else:
+        try:
+            from PIL import ImageFont
+            font = ImageFont.truetype("arialbd.ttf", big // 3)
+        except Exception:
+            font = None
+        text = {"tv": "TV", "optical": "OPT",
+                "analog": "AUX", "usb": "USB"}.get(src, src.upper()[:3])
+        if font:
+            bbox = draw.textbbox((0, 0), text, font=font)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            draw.text(((big - tw) // 2 - bbox[0],
+                       (big - th) // 2 - bbox[1]),
+                      text, fill=fg_rgb, font=font)
+        else:
+            draw.text((big // 4, big // 3), text, fill=fg_rgb)
+
+    # Downscale with high-quality LANCZOS filter → antialiased result
+    return img.resize((size, size), Image.LANCZOS)
+
 
 POLL_INTERVAL_S = 1    # seconds between poll cycles
 
@@ -135,7 +286,13 @@ _STARTUP_REG_NAME = "KEF LSX Controller"
 
 
 def _startup_exe_path():
-    return f'"{sys.executable}"'
+    if getattr(sys, "frozen", False):
+        # PyInstaller .exe
+        return f'"{sys.executable}" --startup'
+    else:
+        # Script mode - use absolute path
+        script_path = Path(__file__).resolve()
+        return f'"{sys.executable}" "{script_path}" --startup'
 
 
 def _is_startup_enabled():
@@ -175,7 +332,7 @@ def _separator(parent):
 # ---------------------------------------------------------------------------
 class KefApp(ctk.CTk):
 
-    def __init__(self, show_event=None):
+    def __init__(self, show_event=None, is_startup=False):
         # DPI-aware BEFORE any window creation, otherwise the mouse hook
         # coordinates won't match what GetWindowRect returns.
         try:
@@ -196,18 +353,22 @@ class KefApp(ctk.CTk):
 
         super().__init__()
         self.title("KEF LSX II Controller")
-        self.geometry("880x600")
-        self.minsize(880, 600)
-        self.resizable(True, True)
+        self.geometry("700x380")
+        self.resizable(False, False)
         try:
             self.iconbitmap(str(ICON_PATH))
         except Exception:
             pass
 
+        # UI zoom (Ctrl + mouse wheel)
+        self._ui_scale = 1.0
+        self.bind_all("<Control-MouseWheel>", self._on_ctrl_wheel)
+
         # Speaker handle — read/written via property to protect cross-thread access
         self._speaker_lock = threading.Lock()
         self._speaker      = None
         self._connected    = False
+        self._is_startup   = is_startup
 
         # Background worker pool (3 threads: connect, poll, cover)
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
@@ -223,6 +384,8 @@ class KefApp(ctk.CTk):
         self._no_cover_img   = None
         self._volume         = 30
         self._tray_icon      = None
+        self._active_source  = None
+        self._speaker_status = None
 
         self._hook      = None
         self._hook_proc = None
@@ -270,6 +433,7 @@ class KefApp(ctk.CTk):
             with CONFIG_PATH.open() as f:
                 data = json.load(f)
             ip = data.get("ip", "")
+            self._auto_start_usb_var.set(data.get("auto_start_usb", False))
             if ip:
                 self._ip_var.set(ip)
                 # Auto-connect once the window is ready
@@ -282,7 +446,10 @@ class KefApp(ctk.CTk):
     def _save_config(self):
         try:
             with CONFIG_PATH.open("w") as f:
-                json.dump({"ip": self._ip_var.get().strip()}, f)
+                json.dump({
+                    "ip": self._ip_var.get().strip(),
+                    "auto_start_usb": self._auto_start_usb_var.get()
+                }, f)
         except Exception:
             pass
 
@@ -291,13 +458,13 @@ class KefApp(ctk.CTk):
     # =========================================================================
 
     def _build_ui(self):
-        self._left = ctk.CTkFrame(self, width=250, corner_radius=10)
-        self._left.pack(side="left", fill="y", padx=(10, 5), pady=10)
+        self._left = ctk.CTkFrame(self, width=LEFT_PANEL_W, corner_radius=8)
+        self._left.pack(side="left", fill="y", padx=(8, 4), pady=8)
         self._left.pack_propagate(False)
 
-        self._right = ctk.CTkFrame(self, corner_radius=10)
+        self._right = ctk.CTkFrame(self, corner_radius=8)
         self._right.pack(side="right", fill="both", expand=True,
-                         padx=(5, 10), pady=10)
+                         padx=(4, 8), pady=8)
 
         self._build_left_panel()
         self._build_right_panel()
@@ -306,97 +473,121 @@ class KefApp(ctk.CTk):
 
     def _build_left_panel(self):
         p = self._left
+        L = LAYOUT  # shorthand
 
+        F = FONTS  # shorthand
+
+        # --- Title ---
         ctk.CTkLabel(p, text="KEF Controller",
-                     font=ctk.CTkFont(size=16, weight="bold")).pack(
-            pady=(15, 5))
+                     font=ctk.CTkFont(size=F["title"], weight="bold")
+                     ).place(x=L["title"]["x"], y=L["title"]["y"])
 
-        ctk.CTkLabel(p, text="Speaker IP Address",
-                     font=ctk.CTkFont(size=12)).pack(pady=(8, 2))
-
+        # --- IP entry ---
         self._ip_var = ctk.StringVar()
         self._ip_entry = ctk.CTkEntry(
             p, textvariable=self._ip_var,
-            placeholder_text="192.168.x.x", width=200)
-        self._ip_entry.pack(pady=2)
+            placeholder_text="192.168.x.x",
+            width=L["ip_entry"]["w"], height=L["ip_entry"]["h"],
+            font=ctk.CTkFont(size=F["ip_entry"]))
+        self._ip_entry.place(x=L["ip_entry"]["x"], y=L["ip_entry"]["y"])
         self._ip_entry.bind("<Return>", lambda _e: self._connect())
 
+        # --- Connect button ---
         self._conn_btn = ctk.CTkButton(
-            p, text="Connect", command=self._connect, width=200)
-        self._conn_btn.pack(pady=(5, 8))
+            p, text="Connect", command=self._connect,
+            width=L["conn_btn"]["w"], height=L["conn_btn"]["h"],
+            font=ctk.CTkFont(size=F["conn_btn"]))
+        self._conn_btn.place(x=L["conn_btn"]["x"], y=L["conn_btn"]["y"])
 
-        _separator(p)
+        # --- Auto-start USB checkbox ---
+        self._auto_start_usb_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            p, text="Auto start USB on boot",
+            variable=self._auto_start_usb_var,
+            command=self._save_config,
+            font=ctk.CTkFont(size=F["auto_usb_check"]),
+            checkbox_width=16, checkbox_height=16,
+        ).place(x=L["auto_usb_check"]["x"], y=L["auto_usb_check"]["y"])
 
-        # --- Status row ---
-        row = ctk.CTkFrame(p, fg_color="transparent")
-        row.pack(fill="x", padx=10, pady=4)
-        self._status_dot = ctk.CTkLabel(
-            row, text="●", font=ctk.CTkFont(size=14), text_color="gray50")
-        self._status_dot.pack(side="left")
-        self._status_lbl = ctk.CTkLabel(
-            row, text="Disconnected", font=ctk.CTkFont(size=12))
-        self._status_lbl.pack(side="left", padx=5)
+        # --- Separator 1 ---
+        ctk.CTkFrame(p, width=L["sep1"]["w"], height=L["sep1"]["h"],
+                     fg_color="gray40").place(
+            x=L["sep1"]["x"], y=L["sep1"]["y"])
 
+        # --- Speaker name (bold) ---
         self._name_lbl = ctk.CTkLabel(
-            p, text="", wraplength=220,
-            font=ctk.CTkFont(size=12, weight="bold"))
-        self._name_lbl.pack(pady=1)
+            p, text="", anchor="w", width=L["name_lbl"]["w"],
+            font=ctk.CTkFont(size=F["name_lbl"], weight="bold"))
+        self._name_lbl.place(x=L["name_lbl"]["x"], y=L["name_lbl"]["y"])
 
+        # --- Model (left) ---
         self._model_lbl = ctk.CTkLabel(
             p, text="", text_color="gray70",
-            font=ctk.CTkFont(size=11))
-        self._model_lbl.pack(pady=1)
+            font=ctk.CTkFont(size=F["model_lbl"]), anchor="w")
+        self._model_lbl.place(x=L["model_lbl"]["x"], y=L["model_lbl"]["y"])
 
+        # --- Firmware (right of model) ---
         self._fw_lbl = ctk.CTkLabel(
-            p, text="", text_color="gray60",
-            font=ctk.CTkFont(size=10))
-        self._fw_lbl.pack(pady=1)
+            p, text="", text_color="gray60", width=L["fw_lbl"]["w"],
+            font=ctk.CTkFont(size=F["fw_lbl"]), anchor="e")
+        self._fw_lbl.place(x=L["fw_lbl"]["x"], y=L["fw_lbl"]["y"])
 
-        _separator(p)
+        # --- Separator 2 ---
+        ctk.CTkFrame(p, width=L["sep2"]["w"], height=L["sep2"]["h"],
+                     fg_color="gray40").place(
+            x=L["sep2"]["x"], y=L["sep2"]["y"])
 
-        # --- Source selection ---
+        # --- Power status dot + label (left) ---
+        self._status_dot = ctk.CTkLabel(
+            p, text="●", font=ctk.CTkFont(size=F["status_dot"]),
+            text_color="gray50")
+        self._status_dot.place(x=L["status_dot"]["x"], y=L["status_dot"]["y"])
+
+        self._status_lbl = ctk.CTkLabel(
+            p, text="Disconnected", anchor="w",
+            font=ctk.CTkFont(size=F["status_lbl"]))
+        self._status_lbl.place(x=L["status_lbl"]["x"], y=L["status_lbl"]["y"])
+
+        # --- "Input Source" label (right) ---
         ctk.CTkLabel(p, text="Input Source",
-                     font=ctk.CTkFont(size=12, weight="bold")).pack(
-            pady=(0, 5))
+                     font=ctk.CTkFont(size=F["input_src_lbl"], weight="bold")
+                     ).place(x=L["input_src_lbl"]["x"],
+                             y=L["input_src_lbl"]["y"])
 
-        grid = ctk.CTkFrame(p, fg_color="transparent")
-        grid.pack(fill="x", padx=10)
-
+        # --- Source buttons (3 columns × 2 rows) ---
         self._src_btns = {}
+        self._src_imgs = {"on": {}, "off": {}}
         for i, src in enumerate(SOURCES):
-            btn = ctk.CTkButton(
-                grid, text=SOURCE_LABELS[src],
-                width=92, height=30,
-                font=ctk.CTkFont(size=11),
-                state="disabled",
-                command=lambda s=src: self._cmd_set_source(s),
+            off_pil = _make_source_btn_image(src, active=False)
+            on_pil  = _make_source_btn_image(src, active=True)
+            self._src_imgs["off"][src] = ctk.CTkImage(
+                light_image=off_pil, dark_image=off_pil,
+                size=(BTN_SIZE, BTN_SIZE))
+            self._src_imgs["on"][src] = ctk.CTkImage(
+                light_image=on_pil, dark_image=on_pil,
+                size=(BTN_SIZE, BTN_SIZE))
+
+            row, col = i // 3, i % 3
+            cx = L["btn_cols_x"][col]
+            cy = L["btn_grid_y"] + row * L["btn_row_h"]
+
+            btn = ctk.CTkLabel(
+                p, text="", image=self._src_imgs["off"][src],
+                width=BTN_SIZE, height=BTN_SIZE,
+                fg_color="transparent", cursor="hand2",
             )
-            btn.grid(row=i // 2, column=i % 2, padx=3, pady=3)
+            btn.place(x=cx, y=cy)
+            btn.bind("<Button-1>",
+                     lambda _e, s=src: self._on_src_click(s))
+
+            lbl = ctk.CTkLabel(
+                p, text=SOURCE_LABELS[src],
+                font=ctk.CTkFont(size=F["btn_label"]),
+                text_color="gray70")
+            lbl.place(x=cx + BTN_SIZE // 2, y=cy + BTN_SIZE + 2,
+                      anchor="n")
+
             self._src_btns[src] = btn
-
-        _separator(p)
-
-        # --- Power ---
-        ctk.CTkLabel(p, text="Power",
-                     font=ctk.CTkFont(size=12, weight="bold")).pack(
-            pady=(0, 5))
-
-        pwr = ctk.CTkFrame(p, fg_color="transparent")
-        pwr.pack(fill="x", padx=10)
-
-        self._power_on_btn = ctk.CTkButton(
-            pwr, text="Power On", width=92, height=30, state="disabled",
-            fg_color=COLOR_PWR_ON[0], hover_color=COLOR_PWR_ON[1],
-            command=self._cmd_power_on,
-        )
-        self._power_on_btn.grid(row=0, column=0, padx=3)
-
-        self._shutdown_btn = ctk.CTkButton(
-            pwr, text="Shutdown", width=92, height=30, state="disabled",
-            fg_color=COLOR_PWR_OFF[0], hover_color=COLOR_PWR_OFF[1],
-            command=self._cmd_shutdown,
-        )
-        self._shutdown_btn.grid(row=0, column=1, padx=3)
 
     # -- Right panel ----------------------------------------------------------
 
@@ -405,10 +596,10 @@ class KefApp(ctk.CTk):
 
         # Cover + song info
         top = ctk.CTkFrame(p, fg_color="transparent")
-        top.pack(fill="x", padx=15, pady=(15, 5))
+        top.pack(fill="x", padx=12, pady=(12, 4))
 
-        self._cover_lbl = ctk.CTkLabel(top, text="", width=185, height=185)
-        self._cover_lbl.pack(side="left", padx=(0, 15))
+        self._cover_lbl = ctk.CTkLabel(top, text="", width=140, height=140)
+        self._cover_lbl.pack(side="left", padx=(0, 12))
         self._set_no_cover()
 
         info_col = ctk.CTkFrame(top, fg_color="transparent")
@@ -416,83 +607,85 @@ class KefApp(ctk.CTk):
 
         self._title_lbl = ctk.CTkLabel(
             info_col, text="--",
-            font=ctk.CTkFont(size=15, weight="bold"),
-            wraplength=340, justify="left", anchor="w")
-        self._title_lbl.pack(fill="x", pady=(20, 4))
+            font=ctk.CTkFont(size=13, weight="bold"),
+            wraplength=280, justify="left", anchor="w")
+        self._title_lbl.pack(fill="x", pady=(8, 2))
 
         self._artist_lbl = ctk.CTkLabel(
             info_col, text="--",
-            font=ctk.CTkFont(size=13), text_color="gray70",
-            wraplength=340, justify="left", anchor="w")
-        self._artist_lbl.pack(fill="x", pady=2)
+            font=ctk.CTkFont(size=11), text_color="gray70",
+            wraplength=280, justify="left", anchor="w")
+        self._artist_lbl.pack(fill="x", pady=1)
 
         self._album_lbl = ctk.CTkLabel(
             info_col, text="--",
-            font=ctk.CTkFont(size=12), text_color="gray60",
-            wraplength=340, justify="left", anchor="w")
-        self._album_lbl.pack(fill="x", pady=2)
+            font=ctk.CTkFont(size=10), text_color="gray60",
+            wraplength=280, justify="left", anchor="w")
+        self._album_lbl.pack(fill="x", pady=1)
 
         self._src_info_lbl = ctk.CTkLabel(
             info_col, text="",
-            font=ctk.CTkFont(size=11), text_color="gray50")
-        self._src_info_lbl.pack(fill="x", pady=(14, 0))
+            font=ctk.CTkFont(size=10), text_color="gray50",
+            anchor="w")
+        self._src_info_lbl.pack(fill="x", pady=(8, 0))
 
         # Progress bar
         pf = ctk.CTkFrame(p, fg_color="transparent")
-        pf.pack(fill="x", padx=15, pady=5)
+        pf.pack(fill="x", padx=12, pady=4)
 
-        self._progress = ctk.CTkProgressBar(pf, height=6)
+        self._progress = ctk.CTkProgressBar(pf, height=5)
         self._progress.pack(fill="x")
         self._progress.set(0)
 
         tf = ctk.CTkFrame(pf, fg_color="transparent")
         tf.pack(fill="x")
         self._time_cur = ctk.CTkLabel(
-            tf, text="0:00", font=ctk.CTkFont(size=10), text_color="gray60")
+            tf, text="0:00", font=ctk.CTkFont(size=9), text_color="gray60")
         self._time_cur.pack(side="left")
         self._time_tot = ctk.CTkLabel(
-            tf, text="0:00", font=ctk.CTkFont(size=10), text_color="gray60")
+            tf, text="0:00", font=ctk.CTkFont(size=9), text_color="gray60")
         self._time_tot.pack(side="right")
 
         # Playback controls
         pb = ctk.CTkFrame(p, fg_color="transparent")
-        pb.pack(pady=10)
+        pb.pack(pady=8)
 
         self._prev_btn = ctk.CTkButton(
-            pb, text="⏮", width=52, height=42,
-            font=ctk.CTkFont(size=18), state="disabled",
+            pb, text="⏮", width=44, height=34,
+            font=ctk.CTkFont(size=15), state="disabled",
             command=self._cmd_prev)
-        self._prev_btn.pack(side="left", padx=5)
+        self._prev_btn.pack(side="left", padx=4)
 
         self._play_btn = ctk.CTkButton(
-            pb, text="⏯", width=62, height=42,
-            font=ctk.CTkFont(size=20), state="disabled",
+            pb, text="⏯", width=54, height=34,
+            font=ctk.CTkFont(size=17), state="disabled",
             command=self._cmd_play_pause)
-        self._play_btn.pack(side="left", padx=5)
+        self._play_btn.pack(side="left", padx=4)
 
         self._next_btn = ctk.CTkButton(
-            pb, text="⏭", width=52, height=42,
-            font=ctk.CTkFont(size=18), state="disabled",
+            pb, text="⏭", width=44, height=34,
+            font=ctk.CTkFont(size=15), state="disabled",
             command=self._cmd_next)
-        self._next_btn.pack(side="left", padx=5)
+        self._next_btn.pack(side="left", padx=4)
 
         _separator(p)
 
         # Volume
         vf = ctk.CTkFrame(p, fg_color="transparent")
-        vf.pack(fill="x", padx=15, pady=5)
+        vf.pack(fill="x", padx=12, pady=4)
 
         ctk.CTkLabel(vf, text="Volume",
-                     font=ctk.CTkFont(size=12, weight="bold")).pack(
-            side="left", padx=(0, 8))
+                     font=ctk.CTkFont(size=11, weight="bold")).pack(
+            side="left", padx=(0, 6))
 
         self._mute_btn = ctk.CTkButton(
-            vf, text="Mute", width=75, height=28,
+            vf, text="Mute", width=60, height=24,
+            font=ctk.CTkFont(size=10),
             state="disabled", command=self._cmd_toggle_mute)
-        self._mute_btn.pack(side="left", padx=(0, 10))
+        self._mute_btn.pack(side="left", padx=(0, 8))
 
         self._vol_lbl = ctk.CTkLabel(
-            vf, text="--", width=32, font=ctk.CTkFont(size=13))
+            vf, text="--", width=26, font=ctk.CTkFont(size=11))
         self._vol_lbl.pack(side="right")
 
         self._vol_slider = ctk.CTkSlider(
@@ -509,17 +702,16 @@ class KefApp(ctk.CTk):
 
     def _set_no_cover(self):
         if self._no_cover_img is None:
-            img = Image.new("RGB", (185, 185), color=(52, 52, 56))
+            img = Image.new("RGB", (140, 140), color=(52, 52, 56))
             self._no_cover_img = ctk.CTkImage(
-                light_image=img, dark_image=img, size=(185, 185))
+                light_image=img, dark_image=img, size=(140, 140))
         self._cover_lbl.configure(image=self._no_cover_img)
 
     def _enable_controls(self, on):
         s = "normal" if on else "disabled"
+        self._src_enabled = on
         for btn in self._src_btns.values():
-            btn.configure(state=s)
-        self._power_on_btn.configure(state=s)
-        self._shutdown_btn.configure(state=s)
+            btn.configure(cursor="hand2" if on else "arrow")
         self._prev_btn.configure(state=s)
         self._play_btn.configure(state=s)
         self._next_btn.configure(state=s)
@@ -540,10 +732,14 @@ class KefApp(ctk.CTk):
     def _highlight_source(self, active_src):
         for src, btn in self._src_btns.items():
             if src == active_src:
-                btn.configure(fg_color=SOURCE_COLORS.get(src, "#1a6b3c"))
+                btn.configure(image=self._src_imgs["on"][src])
             else:
-                btn.configure(fg_color=COLOR_SRC_DEFAULT)
+                btn.configure(image=self._src_imgs["off"][src])
         self._update_tray_icon(active_src)
+
+    def _on_src_click(self, src):
+        if getattr(self, "_src_enabled", False):
+            self._cmd_set_source(src)
 
     @staticmethod
     def _ms_to_str(ms):
@@ -640,6 +836,10 @@ class KefApp(ctk.CTk):
         self._enable_controls(True)
         self._start_polling()
 
+        # Auto-activate USB on startup if configured
+        if self._is_startup and self._auto_start_usb_var.get():
+            self.after(1500, lambda: self._cmd_set_source("usb"))
+
     def _disconnect(self):
         self._poll_running = False
         self._connected = False
@@ -651,6 +851,8 @@ class KefApp(ctk.CTk):
         self._name_lbl.configure(text="")
         self._model_lbl.configure(text="")
         self._fw_lbl.configure(text="")
+        self._active_source = None
+        self._speaker_status = None
         self._enable_controls(False)
         self._reset_now_playing()
         self._update_tray_icon(None)
@@ -717,9 +919,13 @@ class KefApp(ctk.CTk):
         # Power status (powerOn / standby)
         pwr = state.get("speaker_status")
         if pwr:
+            self._speaker_status = pwr
             self._update_power_status(pwr)
             if pwr == PWR_STANDBY:
                 self._update_tray_icon(None)  # grey when off
+                self._active_source = None
+                for src, btn in self._src_btns.items():
+                    btn.configure(image=self._src_imgs["off"][src])
 
         # Player state (playing / paused / stopped / buffering …)
         player_state = state.get("status")
@@ -748,12 +954,15 @@ class KefApp(ctk.CTk):
             self._mute_btn.configure(
                 text="Unmute" if self._muted else "Mute")
 
-        # Source
+        # Source - update before potential auto-USB activation
         src = state.get("source")
         if src and src != PWR_STANDBY:
+            self._active_source = src
             label = SOURCE_LABELS.get(src, src)
             self._src_info_lbl.configure(text=f"Source: {label}")
             self._highlight_source(src)
+        elif src == PWR_STANDBY:
+            self._update_tray_icon(None)
 
         # Song info
         song_info = state.get("song_info")
@@ -791,9 +1000,9 @@ class KefApp(ctk.CTk):
         try:
             with urllib.request.urlopen(url, timeout=5) as resp:
                 raw = resp.read()
-            img = Image.open(BytesIO(raw)).resize((185, 185), Image.LANCZOS)
+            img = Image.open(BytesIO(raw)).resize((140, 140), Image.LANCZOS)
             ctk_img = ctk.CTkImage(
-                light_image=img, dark_image=img, size=(185, 185))
+                light_image=img, dark_image=img, size=(140, 140))
             self._ui_q.put(("cover", ctk_img))
         except Exception:
             pass
@@ -811,24 +1020,17 @@ class KefApp(ctk.CTk):
                     self._ui_q.put(("cmd_error", str(exc)))
             self._executor.submit(_safe)
 
-    def _cmd_power_on(self):
-        def _f():
-            self.speaker.power_on()
-            time.sleep(0.5)
-            self._bg_refresh_state()
-        self._run(_f)
-
-    def _cmd_shutdown(self):
-        def _f():
-            self.speaker.shutdown()
-            self._ui_q.put(("state", {"speaker_status": PWR_STANDBY}))
-        self._run(_f)
-
     def _cmd_set_source(self, src):
-        def _f():
-            self.speaker.source = src
-            self._ui_q.put(("state", {"source": src}))
-        self._run(_f)
+        if self._active_source == src and self._speaker_status == PWR_ON:
+            def _f():
+                self.speaker.shutdown()
+                self._ui_q.put(("state", {"speaker_status": PWR_STANDBY}))
+            self._run(_f)
+        else:
+            def _f():
+                self.speaker.source = src
+                self._ui_q.put(("state", {"source": src, "speaker_status": PWR_ON}))
+            self._run(_f)
 
     def _cmd_play_pause(self):
         spk = self.speaker
@@ -868,6 +1070,39 @@ class KefApp(ctk.CTk):
     def _on_slider_scroll(self, event):
         step = 1 if event.delta > 0 else -1
         self._scroll_volume(step)
+
+    def _on_ctrl_wheel(self, event):
+        """Ctrl + mouse wheel → zoom the whole UI in/out (debounced)."""
+        step = 0.05 if event.delta > 0 else -0.05
+        new_scale = round(self._ui_scale + step, 2)
+        new_scale = max(0.6, min(1.6, new_scale))
+        if new_scale == self._ui_scale:
+            return
+        self._ui_scale = new_scale
+        # Debounce: cancel any pending apply so rapid scrolls coalesce
+        # into a single window resize at the end, killing the flash.
+        if getattr(self, "_zoom_after_id", None):
+            try:
+                self.after_cancel(self._zoom_after_id)
+            except Exception:
+                pass
+        self._zoom_after_id = self.after(80, self._apply_zoom)
+
+    def _apply_zoom(self):
+        """Apply the pending UI scale to widgets and window."""
+        self._zoom_after_id = None
+        scale = self._ui_scale
+        try:
+            # set_widget_scaling scales all CTk widgets (size, fonts, and
+            # place() x/y) automatically. We do NOT pre-multiply widget
+            # widths — CTk would scale them a second time → distortion.
+            ctk.set_widget_scaling(scale)
+            # geometry() is a raw tk method, NOT scaled by CTk → we apply
+            # the scale ourselves so the window matches the widgets.
+            base_w, base_h = 700, 380
+            self.geometry(f"{int(base_w * scale)}x{int(base_h * scale)}")
+        except Exception:
+            pass
 
     # =========================================================================
     # System tray
@@ -985,7 +1220,7 @@ class KefApp(ctk.CTk):
         self._tray_icon.title = f"KEF LSX II ({vol}%)"
 
     @staticmethod
-    def _make_tray_image(bg_hex="#1a6b3c"):
+    def _make_tray_image(bg_hex="#898d8b"):
         # Solid square - no ellipse anti-aliasing so the displayed color
         # in the tray exactly matches the UI button color.
         size = 64
@@ -1023,7 +1258,7 @@ class KefApp(ctk.CTk):
             pystray.MenuItem("Quit", self._tray_quit),
         )
         self._tray_icon = pystray.Icon(
-            "KEF LSX II", self._make_tray_image(), "KEF LSX II", menu)
+            "KEF LSX II", self._make_tray_image("#5A5A5A"), "KEF LSX II", menu)
         threading.Thread(target=self._tray_icon.run, daemon=True).start()
 
     def _tray_activate_usb(self, _icon, _item):
@@ -1113,5 +1348,6 @@ if __name__ == "__main__":
     if _instance_handle is None:
         sys.exit(0)
     _show_event = _create_show_event()
-    app = KefApp(show_event=_show_event)
+    _is_startup = "--startup" in sys.argv
+    app = KefApp(show_event=_show_event, is_startup=_is_startup)
     app.mainloop()

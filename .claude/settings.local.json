@@ -11,7 +11,14 @@
       "Bash(git commit -m 'Stop tracking built binaries; publish via GitHub Releases *)",
       "Bash(git push *)",
       "Bash(git remote *)",
-      "Bash(git tag *)"
+      "Bash(git tag *)",
+      "Bash(cmd /c build.bat)",
+      "Bash(cmd /c \"build.bat\")",
+      "Bash(py -3.14 -m PyInstaller --noconfirm --onefile --noconsole --name \"KEF LSX Controller\" --icon \"Kef-LSX-HP.ico\" --add-data \"Kef-LSX-HP.ico;.\" --collect-data customtkinter --hidden-import pystray._win32 main.py)",
+      "Bash(rmdir /s /q build)",
+      "Bash(del /q \"KEF LSX Controller.spec\")",
+      "Bash(gh release create v0.2.0 'dist\\\\KEF LSX Controller.exe' --title v0.2.0 --notes '- Config stockée dans %APPDATA%\\\\KefLSXController \\(fonctionne depuis C:\\\\Program Files\\) *)",
+      "Bash(python main.py)"
     ]
   }
 }
